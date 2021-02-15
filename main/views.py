@@ -1,0 +1,231 @@
+# -*- coding: UTF-8 -*-
+from datetime import datetime
+from flask import render_template, session, redirect, url_for, current_app, flash, request, abort,make_response
+
+from . import main
+from .forms import NameForm,EditProfileForm,EditProfileAdminForm,PostForm
+from .. import db
+from ..models import User, Role, Permission, Post
+from ..email import send_email
+from flask_login import login_required, current_user
+from ..decorators import admin_required, permission_required
+
+
+@main.route('/edit-profile', methods=['GET', 'POST'])
+@login_required
+def edit_profile():
+    form = EditProfileForm()
+    if form.validate_on_submit():
+        current_user.name = form.name.data
+        current_user.location = form.location.data
+        current_user.about_me = form.about_me.data
+        db.session.add(current_user._get_current_object())
+        db.session.commit()
+        flash('Your profile has been updated.')
+        return redirect(url_for('.user', username=current_user.username))
+    form.name.data = current_user.name
+    form.location.data = current_user.location
+    form.about_me.data = current_user.about_me
+    return render_template('edit_profile.html', form=form)
+
+@main.route('/edit-profile/<int:id>', methods=['GET', 'POST'])
+@login_required
+@admin_required
+def edit_profile_admin(id):
+    user = User.query.get_or_404(id)
+    form = EditProfileAdminForm(user=user)
+    if form.validate_on_submit():
+        user.email = form.email.data
+        user.username = form.username.data
+        user.confirmed = form.confirmed.data
+        user.role = Role.query.get(form.role.data)
+        user.name = form.name.data
+        user.location = form.location.data
+        user.about_me = form.about_me.data
+        db.session.add(user)
+        db.session.commit()
+        flash('The profile has been updated.')
+        return redirect(url_for('.user', username=user.username))
+    form.email.data = user.email
+    form.username.data = user.username
+    form.confirmed.data = user.confirmed
+    form.role.data = user.role_id
+    form.name.data = user.name
+    form.location.data = user.location
+    form.about_me.data = user.about_me
+    return render_template('edit_profile.html', form=form, user=user)
+
+
+# User 和 Post 通过author_id相连  a=User.query.all()[1],b=Post.query.all()[1]  a=b.author a.id=b.author_id=b.id
+'''现在可以在用户界面只看到自己发表的博客，并且带有分页导航，但是这是依靠user.id查询唯一用户对象的，可能会有出错的情况'''
+@main.route('/user/<username>')
+def user(username):
+    user = User.query.filter_by(username=username).first_or_404()
+    page = request.args.get('page', 1, type=int)  # 渲染的页数，查询字符串
+    user_posts = Post.query.filter_by(author_id=user.id)
+    # posts = user_posts.order_by(Post.timestamp.desc()).all()
+    pagination = user_posts.order_by(Post.timestamp.desc()).paginate( # 和 all 的作用类似 ps.121
+        page,                                                   #必须参数 页数
+        per_page=current_app.config['FLASK_POSTS_PER_PAGE'],    #每页 的数据条数
+        error_out=False                                         #当请求页数page超过总数据量时 返回一个空列表
+    ) #根据时间对查询结果排序  数据库查询，默认为esc升序，desc为降序
+    posts = pagination.items
+    return render_template('user.html',user=user,posts=posts,pagination=pagination)
+
+# @main.route('/',methods=['GET','POST'])
+# def index():
+#     # user_agent = request.headers.get('User-Agent')
+#     # response = make_response('<p>这是 cookies !</p>')  #这是响应的内容
+#     # response.set_cookie('answer','42')
+#     # return redirect('http://127.0.0.1:5000/user/yang')  #只能重定向到localhost地址下的网页
+#     # return '<h1>Hello world !your browser is {}</h1>'.format(user_agent)
+#     # return response
+#     form = NameForm()
+#     if form.validate_on_submit():
+#         user = User.query.filter_by(username=form.name.data).first()
+#         if user is None:
+#             user = User(username=form.name.data)
+#             db.session.add(user)
+#             db.session.commit()
+#             session['known'] = False
+#             if current_app.config['FLASKY_ADMIN']:
+#                 '''暂时取消邮件发送功能'''
+#                 # send_email(current_app.config['FLASKY_ADMIN'],'New user','mail/new_user',user=user)
+#         else:
+#             session['known'] = True
+#         session['name'] = form.name.data
+#         form.name.data = ''
+#         # old_name = session.get('name')
+#         # if old_name is not None and old_name != form.name.data:
+#         #     flash('look like you have changed your name')  # 这是一个闪现消息，
+#         # session['name'] = form.name.data
+#         return redirect(url_for('.index'))  # url_for唯一必须参数为端口名， 路由URL链接 ps 29
+#     return render_template('index.html',current_time=datetime.utcnow(),name=session.get('name'),form=form,known=session.get('known',False))
+
+@main.route('/all')
+@login_required
+def show_all():
+    resp = make_response(redirect((url_for('.index'))))
+    resp.set_cookie('show_followed','',max_age=24*60*60) # coolie过期时间为一天
+    return resp
+
+@main.route('/followed')
+@login_required
+def show_followed():
+    resp = make_response(redirect(url_for('.index')))
+    resp.set_cookie('show_followed','1',max_age=24*60*60)
+    return resp
+
+@main.route('/',methods=['GET','POST'])
+def index():
+    form = PostForm()
+    if current_user.can(Permission.WRITE) and form.validate_on_submit():
+        post = Post(body=form.body.data,author=current_user._get_current_object())   #author_id错了
+        db.session.add(post)
+        db.session.commit()
+        return redirect(url_for('.index'))
+    show_followed = False
+    if current_user.is_authenticated:
+        show_followed = bool(request.cookies.get('show_followed',''))
+    if show_followed:
+        query = current_user.followed_posts
+    else:
+        query = Post.query
+    page = request.args.get('page',1,type=int)      #请求查询字符串，默认渲染第一页，
+    pagination = query.order_by(Post.timestamp.desc()).paginate( # 和 all 的作用类似 ps.121
+        page,                                                   #必须参数 页数
+        per_page=current_app.config['FLASK_POSTS_PER_PAGE'],    #每页 的数据条数
+        error_out=False                                         #当请求页数page超过总数据量时 返回一个空列表
+    ) #根据时间对查询结果排序  数据库查询，默认为esc升序，desc为降序
+    posts = pagination.items
+    return render_template('index.html',form=form,posts=posts,pagination=pagination,
+                           show_followed=show_followed,current_time=datetime.utcnow())
+
+@main.route('/post/<int:id>')
+def post(id):
+    post = Post.query.get_or_404(id)
+    return render_template('post.html',posts=[post])
+
+@main.route('/.edit/<int:id>',methods=['GET','POST'])
+@login_required
+def edit(id):
+    post = Post.query.get_or_404(id)
+    if current_user != post.author and not current_user.can(Permission.ADMIN):
+        abort(403)
+    form =PostForm()
+    if form.validate_on_submit():
+        post.body = form.body.data
+        db.session.add(post)
+        db.session.commit()
+        flash("博客已更新")
+        return redirect(url_for('.post',id=post.id))
+    form.body.data = post.body
+    return render_template('edit_post.html',form=form)
+
+@main.route('/follow/<username>')
+@login_required
+@permission_required(Permission.FOLLOW)
+def follow(username):
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        flash('用户不存在')
+        return redirect(url_for('.index'))
+    if current_user.is_following(user):
+        flash('已关注')
+        return redirect(url_for('.user',username=username))
+    current_user.follow(user)
+    db.session.commit()
+    flash('将会关注 %s.' % username)
+    return redirect(url_for('.user',username=username))
+
+@main.route('/unfollow/<username>')   # 在模板中 url_for('.unfollow', username=user.username)
+@login_required
+@permission_required(Permission.FOLLOW)
+def unfollow(username):
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        flash('Invalid user.')
+        return redirect(url_for('.index'))
+    if not current_user.is_following(user):
+        flash('You are not following this user.')
+        return redirect(url_for('.user', username=username))
+    current_user.unfollow(user)
+    db.session.commit()
+    flash('You are not following %s anymore.' % username)
+    return redirect(url_for('.user', username=username))
+
+@main.route('/followers/<username>')
+def followers(username):
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        flash('无效用户')
+        return redirect(url_for('.index'))
+    page = request.args.get('page',1,type=int)
+    pagination = user.followers.paginate(
+        page,
+        per_page=current_app.config['FLASKY_FOLLOWERS_PER_PAGE'],
+        error_out = False
+    )
+    follows = [{'user':item.follower,'timestamp':item.timestamp} for item in pagination.items if item.follower!=user ]
+    return render_template('followers.html',user=user,title='Followers of',endpoint='.followers',pagination=pagination,follows=follows)
+
+@main.route('/followed_by/<username>')
+def followed_by(username):
+    user = User.query.filter_by(username=username).first()
+    if user is None:
+        flash('Invalid user.')
+        return redirect(url_for('.index'))
+    page = request.args.get('page', 1, type=int)
+    pagination = user.followed.paginate(
+        page, per_page=current_app.config['FLASKY_FOLLOWERS_PER_PAGE'],
+        error_out=False)
+    follows = [{'user': item.followed, 'timestamp': item.timestamp}
+               for item in pagination.items if item.followed!=user]
+    return render_template('followers.html', user=user, title="Followed by",
+                           endpoint='.followed_by', pagination=pagination,
+                           follows=follows)
+
+
+
+
+
